@@ -756,10 +756,11 @@ func writeCacheFile(cachePath string, body []byte) error {
 			return nil, fmt.Errorf("failed to lock file: %w", err)
 		}
 
-		// 确保函数返回前解锁和清理
+		// 确保临时文件在函数返回时被清理
 		defer func() {
+			// 如果文件还没关闭，先解锁再关闭
 			utils.UnlockFile(tmpFile)
-			tmpFile.Close()
+			// 删除临时文件（如果重命名成功，这个操作不会有效果）
 			os.Remove(tmpPath)
 		}()
 
@@ -773,7 +774,7 @@ func writeCacheFile(cachePath string, body []byte) error {
 			return nil, fmt.Errorf("failed to sync temp file: %w", err)
 		}
 
-		// 关闭文件（保持锁定）
+		// 关闭文件（这会释放文件句柄，但不会删除文件）
 		if err := tmpFile.Close(); err != nil {
 			return nil, fmt.Errorf("failed to close temp file: %w", err)
 		}
