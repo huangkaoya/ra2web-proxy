@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"ra2web-proxy/pkg/utils"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,15 +30,16 @@ import (
 )
 
 type Config struct {
-	MainTargetURL  string       `json:"main_target_url"`
-	MainEntryList  []string     `json:"main_entry_list"`
-	ResTargetURL   string       `json:"res_target_url"`
-	ResEntryList   []string     `json:"res_entry_list"`
-	ApiEndpoint    []string     `json:"api_endpoint"`
-	AllowedOrigins []string     `json:"allowed_origins"`
-	BaseHref       string       `json:"base_href"`
-	HTTP           ConfigHTTP   `json:"http"`
-	HTTPS          *ConfigHTTPS `json:"https"`
+	MainTargetURL  string              `json:"main_target_url"`
+	MainEntryList  []string            `json:"main_entry_list"`
+	ResTargetURL   string              `json:"res_target_url"`
+	ResEntryList   []string            `json:"res_entry_list"`
+	ApiEndpoint    []string            `json:"api_endpoint"`
+	AllowedOrigins []string            `json:"allowed_origins"`
+	AllowedFiles   map[string][]string `json:"allowed_files"` // 域名到允许文件路径正则表达式列表的映射
+	BaseHref       string              `json:"base_href"`
+	HTTP           ConfigHTTP          `json:"http"`
+	HTTPS          *ConfigHTTPS        `json:"https"`
 }
 
 type ConfigHTTP struct {
@@ -145,6 +147,20 @@ func main() {
 	err = json.Unmarshal(configFile, &config)
 	if err != nil {
 		log.Fatal().Msgf("unable to parse config file: %v", err)
+	}
+
+	// 确保AllowedFiles不是nil
+	if config.AllowedFiles == nil {
+		config.AllowedFiles = make(map[string][]string)
+	}
+
+	// 输出当前配置的域名限制信息
+	for domain, patterns := range config.AllowedFiles {
+		log.Info().
+			Str("domain", domain).
+			Int("patternCount", len(patterns)).
+			Strs("patterns", patterns).
+			Msg("Domain file access rules loaded")
 	}
 
 	for _, origin := range config.AllowedOrigins {
@@ -303,6 +319,16 @@ func mainProxyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	hostDir := targetURLType.(string) + ".site"
+
+	// 检查文件是否在域名的允许列表中
+	if !isFileAllowedForDomain(host, r.URL.Path) {
+		log.Info().
+			Str("host", host).
+			Str("path", r.URL.Path).
+			Msg("File access restricted by domain policy")
+		http.Error(w, "Access to this resource is restricted", http.StatusForbidden)
+		return
+	}
 
 	// 代理缓存命中检查
 	cachePath := filepath.Join(cacheDir, hostDir, r.URL.Path)
@@ -484,6 +510,10 @@ func mainProxyHandler(w http.ResponseWriter, r *http.Request) {
 
 					if r.URL.Path == "/dist/workerHost.min.js" {
 						body = modifyWorkerHostJS(body)
+					}
+
+					if r.URL.Path == "/dist/worker.min.js" {
+						body = modifyWorkerJS(body)
 					}
 
 					response.Body = io.NopCloser(bytes.NewReader(body))
@@ -826,8 +856,52 @@ func modifyIndexHTML(body []byte) ([]byte, error) {
 // 添加辅助函数来处理 workerHost.min.js 的修改
 func modifyWorkerHostJS(body []byte) []byte {
 	bodyStr := string(body)
+	// 强制启用CORS工作区功能
 	bodyStr = strings.Replace(bodyStr, `(null===(r=null==t?void 0:t.CORSWorkaround)||void 0===r||r)`, `true`, 1)
 	bodyStr = strings.Replace(bodyStr, `"string"==typeof e&&o(e)&&(null===(i=null==t?void 0:t.CORSWorkaround)||void 0===i||i)`, `true`, 1)
+
+	// 修复Worker脚本URL路径问题，使用配置中的BaseHref
+	re := regexp.MustCompile(`new s\("\.\/dist\/worker\.min\.js(\?[^"]+)?"`)
+	bodyStr = re.ReplaceAllStringFunc(bodyStr, func(match string) string {
+		// 提取查询参数部分
+		queryMatch := regexp.MustCompile(`(\?[^"]+)?"`).FindStringSubmatch(match)
+		queryParam := ""
+		if len(queryMatch) > 1 && queryMatch[1] != "" {
+			queryParam = queryMatch[1]
+		}
+
+		// 构建新的URL，使用配置中的BaseHref
+		baseHref := config.BaseHref
+		if !strings.HasSuffix(baseHref, "/") {
+			baseHref += "/"
+		}
+
+		return `new s("` + baseHref + `dist/worker.min.js` + queryParam + `"`
+	})
+
+	return []byte(bodyStr)
+}
+
+// 添加辅助函数来处理 worker.min.js 的修改
+func modifyWorkerJS(body []byte) []byte {
+	bodyStr := string(body)
+
+	// 修改s.p赋值逻辑，确保动态加载的workerVxl.js使用正确的路径
+	publicPathRegex := regexp.MustCompile(`\(t=t\.replace\(\/#\.\*\$\/,""\)\.replace\(/\\\?\.\*\$\/,""\)\.replace\(/\\\/\[\^\\\/\]\+\$\//,"/"\),s\.p=t\)`)
+
+	// 构建新的baseHref路径
+	baseHref := config.BaseHref
+	if !strings.HasSuffix(baseHref, "/") {
+		baseHref += "/"
+	}
+
+	// 替换为直接使用baseHref的赋值
+	bodyStr = publicPathRegex.ReplaceAllString(bodyStr, `(s.p="`+baseHref+`dist/")`)
+
+	// 修改s.u函数返回workerVxl.js的绝对路径而不是相对路径
+	suFuncRegex := regexp.MustCompile(`s\.u=(\w+)=>"workerVxl\.js\?v=0\.75\.0"`)
+	bodyStr = suFuncRegex.ReplaceAllString(bodyStr, `s.u=$1=>"`+baseHref+`dist/workerVxl.js?v=0.75.0"`)
+
 	return []byte(bodyStr)
 }
 
@@ -843,4 +917,38 @@ func sendLog(msg LogMessage) {
 			Str("url", msg.RequestURL).
 			Msg("Log channel full, message dropped")
 	}
+}
+
+// 检查文件是否在域名的允许列表中
+func isFileAllowedForDomain(host string, path string) bool {
+	allowedPatterns, exists := config.AllowedFiles[host]
+	if !exists || len(allowedPatterns) == 0 {
+		// 如果域名不在限制列表中或允许列表为空，允许访问所有文件
+		return true
+	}
+
+	// 处理请求路径
+	// 移除URL中的查询参数和片段标识符
+	path = strings.Split(path, "?")[0]
+	path = strings.Split(path, "#")[0]
+
+	// 如果路径以 / 结尾，添加 index.html
+	if strings.HasSuffix(path, "/") {
+		path = path + "index.html"
+	}
+
+	// 如果路径为空，视为 /index.html
+	if path == "" || path == "/" {
+		path = "/index.html"
+	}
+
+	// 检查路径是否匹配任何允许的模式
+	for _, pattern := range allowedPatterns {
+		matched, err := regexp.MatchString(pattern, path)
+		if err == nil && matched {
+			return true
+		}
+	}
+
+	return false
 }
